@@ -28,12 +28,6 @@ function(bpftime_add_library target)
     bpftime_setup_target(${target})
 endfunction()
 
-bpftime_add_library(llvmbpf_vm
-    src/llvm_jit_context.cpp
-    src/compiler.cpp
-    src/compiler_utils.cpp
-    src/vm.cpp
-)
 
 set_target_properties(llvmbpf_vm PROPERTIES ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/../")
 
