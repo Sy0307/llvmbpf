@@ -26,7 +26,7 @@ const static char *LDDW_HELPER_MAP_VAL = "__lddw_helper_map_val";
 const static char *LDDW_HELPER_VAR_ADDR = "__lddw_helper_var_addr";
 const static char *LDDW_HELPER_CODE_ADDR = "__lddw_helper_code_addr";
 
-#define IS_ALIGNED(x, a) (((uintptr_t)(x) & ((a) - 1)) == 0)
+#define IS_ALIGNED(x, a) (((uintptr_t)(x) & ((a)-1)) == 0)
 
 #ifndef EBPF_STACK_SIZE
 // Compatible to C headers
@@ -35,31 +35,47 @@ const static char *LDDW_HELPER_CODE_ADDR = "__lddw_helper_code_addr";
 
 class llvm_bpf_jit_context {
 	llvmbpf_vm &vm;
-	std::optional<std::unique_ptr<llvm::orc::LLJIT> > jit;
+
 	std::unique_ptr<pthread_spinlock_t> compiling;
 	llvm::Expected<llvm::orc::ThreadSafeModule>
 
 	generateModule(const std::vector<std::string> &extFuncNames,
 		       const std::vector<std::string> &lddwHelpers,
-		       bool patch_map_val_at_compile_time);
+		       bool patch_map_val_at_compile_time,
+		       bool main_func_with_arguments = true,
+		       const std::string &func_name = "bpf_main",
+		       bool is_cuda = false);
 	std::vector<uint8_t>
 	do_aot_compile(const std::vector<std::string> &extFuncNames,
 		       const std::vector<std::string> &lddwHelpers,
 		       bool print_ir);
 	// (JIT, extFuncs, definedLddwSymbols)
 	std::tuple<std::unique_ptr<llvm::orc::LLJIT>, std::vector<std::string>,
-		   std::vector<std::string> >
+		   std::vector<std::string>>
 	create_and_initialize_lljit_instance();
 
     public:
+	std::optional<std::unique_ptr<llvm::orc::LLJIT>> jit;
 	llvm::Error do_jit_compile();
 	llvm_bpf_jit_context(llvmbpf_vm &vm);
 	virtual ~llvm_bpf_jit_context();
 	precompiled_ebpf_function get_entry_address();
 	std::vector<uint8_t> do_aot_compile(bool print_ir = false);
 	llvm::Error load_aot_object(const std::vector<uint8_t> &buf);
+	std::optional<std::string>
+	generate_ptx(bool main_with_arguments = true,
+		     const std::string &func_name = "bpf_main",
+		     const char *target_cpu = "sm_60");
 };
-
+/**
+ * @brief Get the default trampoline ptx object, used for helper operations, which is generated from `test.cu` 
+ * 
+ * @return std::string 
+ */
+std::string get_default_trampoline_ptx();
+std::string patch_helper_names_and_header(std::string ptx_to_wrap);
+std::string patch_main_from_func_to_entry(std::string);
+std::string wrap_ptx_with_trampoline(std::string input);
 } // namespace bpftime
 
 #endif

@@ -11,11 +11,11 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 if(NOT DEFINED SPDLOG_ACTIVE_LEVEL)
-  if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    add_compile_definitions(SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_TRACE)
-  else()
-    add_compile_definitions(SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_INFO)
-  endif()
+    if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+        add_compile_definitions(SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_TRACE)
+    else()
+        add_compile_definitions(SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_INFO)
+    endif()
 endif()
 
 function(bpftime_setup_target target)
@@ -58,28 +58,53 @@ option(ENABLE_LLVM_SHARED "Link shared library of LLVM" NO)
 option(BUILD_LLVM_AOT_CLI "Build AOT cli, which rely on libbpf" NO)
 
 if(ENABLE_LLVM_SHARED)
-    set(LLVM_LIBS LLVM)
+    list(PREPEND LLVM_LIBS LLVM)
 else()
     llvm_map_components_to_libnames(LLVM_LIBS
         Core
-        OrcJIT
-        mcjit
         Support
-        nativecodegen
+        Target
+        Analysis
+        ipo
+        TransformUtils
+        BitReader
+        AsmParser
+        Linker
+        MC
+        MCParser
+        MCDisassembler
+        Object
+        ExecutionEngine
+        RuntimeDyld
+        OrcJIT
+        MCJIT
+        # X86
+        X86CodeGen
+        X86Desc
+        X86Info
+        X86AsmParser
+        # NVPTX
+        NVPTXCodeGen
+        NVPTXDesc
+        NVPTXInfo
+        # AArch64
+        AArch64CodeGen
+        AArch64Desc
+        AArch64Info
+        AArch64AsmParser
     )
 endif()
-
 include(FetchContent)
 
 if(NOT DEFINED SPDLOG_INCLUDE)
-    message(INFO " Adding spdlog seperately..")
+    message(STATUS " Adding spdlog seperately..")
 
     # spdlog
     # Fetch spdlog
     FetchContent_Declare(
         spdlog
         GIT_REPOSITORY https://github.com/gabime/spdlog.git
-        GIT_TAG v1.14.1 # Specify the version you want to use
+        GIT_TAG v1.15.2 # Specify the version you want to use
     )
 
     # Make the spdlog target available
@@ -97,7 +122,7 @@ else()
 
 
     if(${BPFTIME_ENABLE_UNIT_TESTING})
-        if (NOT TARGET Catch2)
+        if(NOT TARGET Catch2)
             message(STATUS "Adding Catch2 by FetchContent at llvmbpf")
             FetchContent_Declare(
                 Catch2
@@ -113,9 +138,9 @@ endif()
 
 message(STATUS "LLVM_LIBS=${LLVM_LIBS}")
 
-target_link_libraries(llvmbpf_vm PUBLIC ${LLVM_LIBS} PRIVATE spdlog::spdlog)
+target_link_libraries(llvmbpf_vm PRIVATE ${LLVM_LIBS} PRIVATE spdlog::spdlog)
 target_include_directories(llvmbpf_vm
-    PUBLIC ${LLVM_INCLUDE_DIRS} ${SPDLOG_INCLUDE} ${Boost_INCLUDE} ../include include # LLVM jit also used these headers
+    PRIVATE ${LLVM_INCLUDE_DIRS} ${SPDLOG_INCLUDE} ${Boost_INCLUDE} ../include include # LLVM jit also used these headers
 )
 add_dependencies(llvmbpf_vm spdlog::spdlog)
 
@@ -131,3 +156,10 @@ if(BPFTIME_ENABLE_UNIT_TESTING)
 endif()
 
 add_subdirectory(example)
+
+
+option(LLVMBPF_ENABLE_DEMO "Whether build the demo program, which requires CUDA" OFF)
+
+if(LLVMBPF_ENABLE_DEMO)
+    add_subdirectory(demo)
+endif()

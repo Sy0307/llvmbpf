@@ -4,6 +4,8 @@
  * All rights reserved.
  */
 
+#include <llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h>
+#include "./trampoline_ptx.h"
 #ifdef WIN32
 #pragma warning(disable : 4141 4244 4291 4146 4267 4275 4624 4800)
 #endif
@@ -30,7 +32,6 @@
 #else
 #include <llvm/Support/Host.h>
 #endif
-#include <llvm/Support/ManagedStatic.h>
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/SourceMgr.h>
 #include <llvm/Support/TargetSelect.h>
@@ -236,8 +237,14 @@ llvm_bpf_jit_context::llvm_bpf_jit_context(llvmbpf_vm &vm) : vm(vm)
 	if (__atomic_compare_exchange_n(&llvm_initialized, &zero, 1, false,
 					__ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
 		SPDLOG_DEBUG("Initializing llvm");
-		InitializeNativeTarget();
-		InitializeNativeTargetAsmPrinter();
+		llvm::InitializeNativeTarget();
+		llvm::InitializeNativeTarget();
+		llvm::InitializeNativeTargetAsmPrinter();
+		llvm::InitializeNativeTargetAsmParser();
+
+		LLVMInitializeNVPTXTarget();
+		LLVMInitializeNVPTXTargetMC();
+		
 	}
 	compiling = std::make_unique<pthread_spinlock_t>();
 	pthread_spin_init(compiling.get(), PTHREAD_PROCESS_PRIVATE);
@@ -416,16 +423,16 @@ llvm_bpf_jit_context::load_aot_object(const std::vector<uint8_t> &buf)
 	this->get_entry_address();
 	return llvm::Error::success();
 }
-
 std::tuple<std::unique_ptr<llvm::orc::LLJIT>, std::vector<std::string>,
-	   std::vector<std::string> >
+	   std::vector<std::string>>
 llvm_bpf_jit_context::create_and_initialize_lljit_instance()
 {
+	static ExitOnError exitOnErr;
 	// Create a JIT builder
 	SPDLOG_DEBUG("LLVM-JIT: Creating LLJIT instance");
 	auto jit_err = LLJITBuilder().create();
 	if (!jit_err) {
-		(void)jit_err.takeError();
+		exitOnErr(jit_err.takeError());
 		return std::make_tuple(nullptr, std::vector<std::string>{},
 				       std::vector<std::string>{});
 	}
@@ -526,3 +533,147 @@ precompiled_ebpf_function llvm_bpf_jit_context::get_entry_address()
 		return addr;
 	}
 }
+
+static std::unique_ptr<llvm::TargetMachine>
+createNVPTXTargetMachine(const char *target_cpu)
+{
+	std::string error;
+	const llvm::Target *target =
+		llvm::TargetRegistry::lookupTarget("nvptx64", error);
+	if (!target) {
+		throw std::runtime_error("Failed to find NVPTX target: " +
+					 error);
+	}
+
+	llvm::Triple triple("nvptx64-nvidia-cuda");
+
+	llvm::TargetOptions options;
+	options.FloatABIType = llvm::FloatABI::Default;
+	auto result = std::unique_ptr<llvm::TargetMachine>(
+		target->createTargetMachine(triple.str(), target_cpu, "",
+					    options, llvm::Reloc::Static));
+	return result;
+}
+std::optional<std::string>
+llvm_bpf_jit_context::generate_ptx(bool main_with_arguments,
+				   const std::string &func_name,
+				   const char *target_cpu)
+{
+	static ExitOnError exitOnErr;
+	spin_lock_guard guard(compiling.get());
+	auto targetMachine = createNVPTXTargetMachine(target_cpu);
+	std::vector<std::string> extFuncNames;
+	for (uint32_t i = 0; i < std::size(vm.ext_funcs); i++) {
+		if (vm.ext_funcs[i].has_value()) {
+			extFuncNames.push_back(ext_func_sym(i));
+		}
+	}
+	std::vector<std::string> definedLddwHelpers;
+	const auto tryDefineLddwHelper = [&](const char *name, void *func) {
+		if (func) {
+			SPDLOG_DEBUG("Defining LDDW helper {} with addr {:x}",
+				     name, (uintptr_t)func);
+			definedLddwHelpers.push_back(name);
+		}
+	};
+	// Only map_val will have a chance to be called at runtime, so it's the
+	// only symbol to be defined
+	tryDefineLddwHelper(LDDW_HELPER_MAP_VAL, (void *)vm.map_val);
+	// These symbols won't be used at runtime, because we have already
+	// do relocation when loading the eBPF bytecode
+	// tryDefineLddwHelper(LDDW_HELPER_MAP_BY_FD, (void *)vm.map_by_fd);
+	// tryDefineLddwHelper(LDDW_HELPER_MAP_BY_IDX, (void *)vm.map_by_idx);
+	// tryDefineLddwHelper(LDDW_HELPER_CODE_ADDR, (void *)vm.code_addr);
+	// tryDefineLddwHelper(LDDW_HELPER_VAR_ADDR, (void *)vm.var_addr);
+
+	auto bpfModuleOrErr =
+		generateModule(extFuncNames, definedLddwHelpers, true,
+			       main_with_arguments, func_name, true);
+	if (!bpfModuleOrErr) {
+		exitOnErr(bpfModuleOrErr.takeError());
+		return {};
+	}
+
+	// If successful, get the module
+	auto bpfModule = std::move(*bpfModuleOrErr);
+	// Optimize the module
+	return bpfModule.withModuleDo([&](auto &M) {
+		M.setDataLayout(targetMachine->createDataLayout());
+		optimizeModule(M);
+
+		llvm::legacy::PassManager passManager;
+#if LLVM_VERSION_MAJOR > 15
+		CodeGenFileType fileType = CodeGenFileType::AssemblyFile;
+#else
+		CodeGenFileType fileType = llvm::CGFT_AssemblyFile;
+
+#endif
+		SmallVector<char, 0> objStream;
+		std::unique_ptr<raw_svector_ostream> BOS =
+			std::make_unique<raw_svector_ostream>(objStream);
+
+		if (targetMachine->addPassesToEmitFile(passManager, *BOS,
+						       nullptr, fileType)) {
+			throw std::runtime_error(
+				"TargetMachine cannot emit a file of this type");
+		}
+
+		passManager.run(M);
+		std::string result(objStream.begin(), objStream.end());
+
+		return result;
+	});
+}
+
+namespace bpftime
+{
+std::string get_defaul_trampoline_ptx()
+{
+	return TRAMPOLINE_PTX;
+}
+std::string wrap_ptx_with_trampoline(std::string input)
+{
+	return get_defaul_trampoline_ptx() + input;
+}
+std::string patch_helper_names_and_header(std::string result)
+{
+	const std::string to_replace_names[][2] = {
+		{ "_bpf_helper_ext_0001", "_bpf_helper_ext_0001_dup" },
+		{ "_bpf_helper_ext_0002", "_bpf_helper_ext_0002_dup" },
+		{ "_bpf_helper_ext_0003", "_bpf_helper_ext_0003_dup" },
+		{ "_bpf_helper_ext_0006", "_bpf_helper_ext_0006_dup" },
+
+	};
+	const std::string version_headers[] = {
+		".version 3.2\n.target sm_60\n.address_size 64\n",
+		".version 5.0\n.target sm_60\n.address_size 64\n"
+	};
+	for (const auto &entry : to_replace_names) {
+		auto idx = result.find(entry[0]);
+		if (idx != result.npos) {
+			result = result.replace(idx, entry[0].size(), entry[1]);
+		}
+	}
+	for (const auto &header : version_headers) {
+		auto idx = result.find(header);
+		SPDLOG_INFO("Version header ({}) index: {}", header, idx);
+		if (idx != result.npos) {
+			result = result.replace(idx, header.size(), "");
+		}
+	}
+	return result;
+}
+std::string patch_main_from_func_to_entry(std::string result)
+{
+	const std::string entry_func = ".visible .func bpf_main";
+
+	auto idx = result.find(entry_func);
+	SPDLOG_INFO("entry_func ({}) index {}", entry_func, idx);
+
+	if (idx != result.npos) {
+		result = result.replace(idx, entry_func.size(),
+					".visible .entry bpf_main");
+	}
+	return result;
+}
+} // namespace bpftime
