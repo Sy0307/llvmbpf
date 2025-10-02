@@ -458,7 +458,7 @@ llvm_bpf_jit_context::create_and_initialize_lljit_instance()
             }
             auto ok = llvm::sys::DynamicLibrary::LoadLibraryPermanently(name);
             if (!ok) {
-                SPDLOG_WARN("LLVM-JIT: failed to preload {} for ORC runtime wrappers", name);
+                SPDLOG_DEBUG("LLVM-JIT: failed to preload {} for ORC runtime wrappers", name);
             }
             if (llvm::sys::DynamicLibrary::SearchForAddressOfSymbol("llvm_orc_registerEHFrameSectionWrapper")) {
                 SPDLOG_DEBUG("LLVM-JIT: preloaded {} for ORC runtime wrappers", name);
