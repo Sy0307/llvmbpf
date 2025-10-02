@@ -145,8 +145,22 @@
 #include "llvm/IR/Module.h"
 #include <llvm/ExecutionEngine/JITSymbol.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
+// Prefer feature-detection over hardcoding LLVM_VERSION_MAJOR here.
+// These ORC headers (DynamicLibrarySearchGenerator vs ExecutionUtils) moved
+// between LLVM releases. Using __has_include keeps the code resilient across
+// minor/packaging differences without forcing a specific version guard.
+#if defined(__has_include)
+#  if __has_include(<llvm/ExecutionEngine/Orc/DynamicLibrarySearchGenerator.h>)
+#    include <llvm/ExecutionEngine/Orc/DynamicLibrarySearchGenerator.h>
+#    define BPFTIME_HAVE_ORC_DYNLIB_SEARCH_GEN 1
+#  elif __has_include(<llvm/ExecutionEngine/Orc/ExecutionUtils.h>)
+#    include <llvm/ExecutionEngine/Orc/ExecutionUtils.h>
+#    define BPFTIME_HAVE_ORC_EXECUTIONUTILS 1
+#  endif
+#endif
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Support/Error.h>
+#include <llvm/Support/DynamicLibrary.h>
 #include <llvm/ExecutionEngine/JITSymbol.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/Transforms/IPO.h>
@@ -426,6 +440,32 @@ llvm_bpf_jit_context::create_and_initialize_lljit_instance()
 	static ExitOnError exitOnErr;
 	// Create a JIT builder
 	SPDLOG_DEBUG("LLVM-JIT: Creating LLJIT instance");
+    // Preload libLLVM before creating LLJIT so that ORC runtime wrapper symbols
+    // (e.g. llvm_orc_registerEHFrameSectionWrapper) are visible during create.
+    // Allow overriding SONAME via environment variable BPFTIME_LLVM_SONAME.
+    {
+        const char *envSoname = ::getenv("BPFTIME_LLVM_SONAME");
+        const char *candidates[] = {
+            envSoname && envSoname[0] ? envSoname : (const char *)nullptr,
+            "libLLVM-17.so",
+            "libLLVM.so",
+            "libLLVM-17.0.6.so",
+        };
+        for (const char *name : candidates) {
+            if (!name) {
+                SPDLOG_DEBUG("LLVM-JIT: skipping empty LLVM SONAME candidate");
+                continue;
+            }
+            auto ok = llvm::sys::DynamicLibrary::LoadLibraryPermanently(name);
+            if (!ok) {
+                SPDLOG_DEBUG("LLVM-JIT: failed to preload {} for ORC runtime wrappers", name);
+            }
+            if (llvm::sys::DynamicLibrary::SearchForAddressOfSymbol("llvm_orc_registerEHFrameSectionWrapper")) {
+                SPDLOG_DEBUG("LLVM-JIT: preloaded {} for ORC runtime wrappers", name);
+                break;
+            }
+        }
+    }
 	auto jit_err = LLJITBuilder().create();
 	if (!jit_err) {
 		exitOnErr(jit_err.takeError());
@@ -434,6 +474,26 @@ llvm_bpf_jit_context::create_and_initialize_lljit_instance()
 	}
 	auto jit = std::move(*jit_err);
 
+	// Make current process symbols visible to the JIT if supported
+#if BPFTIME_HAVE_ORC_DYNLIB_SEARCH_GEN
+	{
+		auto &jd = jit->getMainJITDylib();
+		auto gen = llvm::cantFail(
+			llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
+				jit->getDataLayout().getGlobalPrefix()));
+		jd.addGenerator(std::move(gen));
+	}
+#elif BPFTIME_HAVE_ORC_EXECUTIONUTILS
+	{
+		auto &jd = jit->getMainJITDylib();
+		auto gen = llvm::cantFail(
+			llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
+				jit->getDataLayout().getGlobalPrefix()));
+		jd.addGenerator(std::move(gen));
+	}
+#else
+	(void)0;
+#endif
 	auto &mainDylib = jit->getMainJITDylib();
 	std::vector<std::string> extFuncNames;
 	// insert the helper functions
@@ -465,7 +525,7 @@ llvm_bpf_jit_context::create_and_initialize_lljit_instance()
 		jit->getExecutionSession().intern("__aeabi_unwind_cpp_pr1"),
 		JITEvaluatedSymbol::fromPointer(__aeabi_unwind_cpp_pr1));
 #endif
-	if (auto err = mainDylib.define(absoluteSymbols(extSymbols)); !err) {
+	if (auto err = mainDylib.define(absoluteSymbols(extSymbols)); err) {
 		SPDLOG_DEBUG("LLVM-JIT: failed to define external symbols");
 	}
 	// Define lddw helpers
@@ -504,9 +564,15 @@ llvm_bpf_jit_context::create_and_initialize_lljit_instance()
 	// tryDefineLddwHelper(LDDW_HELPER_MAP_BY_IDX, (void *)vm.map_by_idx);
 	// tryDefineLddwHelper(LDDW_HELPER_CODE_ADDR, (void *)vm.code_addr);
 	// tryDefineLddwHelper(LDDW_HELPER_VAR_ADDR, (void *)vm.var_addr);
-	if (auto err = mainDylib.define(absoluteSymbols(lddwSyms)); !err) {
-		SPDLOG_DEBUG("LLVM-JIT: failed to define lddw helpers symbols");
-	}
+	
+	bool lddwDefinedOK = true;
+	if (auto err = mainDylib.define(absoluteSymbols(lddwSyms)); err) {
+        SPDLOG_DEBUG("LLVM-JIT: failed to define lddw helpers symbols");
+        lddwDefinedOK = false;
+    }
+    if (!lddwDefinedOK) {
+        definedLddwHelpers.clear();
+    }
 	return { std::move(jit), extFuncNames, definedLddwHelpers };
 }
 
