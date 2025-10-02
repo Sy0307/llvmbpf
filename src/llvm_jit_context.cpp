@@ -452,10 +452,14 @@ llvm_bpf_jit_context::create_and_initialize_lljit_instance()
             "libLLVM-17.0.6.so",
         };
         for (const char *name : candidates) {
-            if (!name)
+            if (!name) {
+                SPDLOG_DEBUG("LLVM-JIT: skipping empty LLVM SONAME candidate");
                 continue;
+            }
             auto ok = llvm::sys::DynamicLibrary::LoadLibraryPermanently(name);
-            (void)ok;
+            if (!ok) {
+                SPDLOG_WARN("LLVM-JIT: failed to preload {} for ORC runtime wrappers", name);
+            }
             if (llvm::sys::DynamicLibrary::SearchForAddressOfSymbol("llvm_orc_registerEHFrameSectionWrapper")) {
                 SPDLOG_DEBUG("LLVM-JIT: preloaded {} for ORC runtime wrappers", name);
                 break;
