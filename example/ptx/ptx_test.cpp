@@ -166,7 +166,7 @@ static std::vector<char> compile(const std::string &ptx)
 	return elf_binary;
 }
 
-static constexpr int GPU_HELPER_MAX_BUF = 1 << 24;
+static constexpr int GPU_HELPER_MAX_BUF = 1 << 25;
 
 enum class HelperOperation {
 	MAP_LOOKUP = 1,
